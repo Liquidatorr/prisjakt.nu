@@ -2,6 +2,7 @@ import re
 import json
 from urllib.parse import urlparse, parse_qs
 import scrapy
+from datetime import datetime
 
 
 def norm_ws(s: str | None) -> str | None:
@@ -11,7 +12,6 @@ def norm_ws(s: str | None) -> str | None:
 
 
 def parse_price(text: str | None):
-    """Parse price and currency from a string (e.g. '1,985 SEK', '1 985 kr', '1.985 kr')."""
     if not text:
         return None, None, None
     text = text.replace("\xa0", " ").replace("\u202f", " ").replace("\u2009", " ")
@@ -44,41 +44,30 @@ def parse_price(text: str | None):
 
 
 class PrisjaktSpider(scrapy.Spider):
-    name = "prisjakt.nu"
+    name = "prisjakt"
     allowed_domains = ["prisjakt.nu"]
+
     start_urls = [
         "https://www.prisjakt.nu/c/moderkort",
-        # "https://www.prisjakt.nu/c/vattenkylningssystem",
-        # "https://www.prisjakt.nu/c/nataggregat",
         "https://www.prisjakt.nu/c/grafikkort",
     ]
 
     custom_settings = {
-        "CONCURRENT_REQUESTS": 64,
-        "CONCURRENT_REQUESTS_PER_DOMAIN": 32,
-        "CONCURRENT_REQUESTS_PER_IP": 32,
-        "AUTOTHROTTLE_ENABLED": False,
-        "DOWNLOAD_DELAY": 0,
-        "RANDOMIZE_DOWNLOAD_DELAY": False,
+        "CONCURRENT_REQUESTS": 16,
+        "DOWNLOAD_DELAY": 0.3,
+        "AUTOTHROTTLE_ENABLED": True,
+        "AUTOTHROTTLE_START_DELAY": 1,
+        "AUTOTHROTTLE_MAX_DELAY": 10,
         "DEFAULT_REQUEST_HEADERS": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/124.0.0.0 Safari/537.36",
             "Accept-Language": "sv-SE,sv;q=0.9,en-US;q=0.8,nl;q=0.7",
         },
-        "HTTPERROR_ALLOWED_CODES": [403, 404],
-        "REDIRECT_ENABLED": True,
-        "FEED_EXPORT_ENCODING": "utf-8",
-        "FEED_EXPORT_FIELDS": [
-            "category",
-            "product_id",
-            "product_title",
-            "product_url",
-            "seller_name",
-            "price_value",
-            "price_currency",
-            "price_raw",
-            "source",
-        ],
+        # ✅ Pipeline koppelen
+        "ITEM_PIPELINES": {
+            "prisjakt.pipelines.PrisjaktExportPipeline": 300,
+        },
     }
 
     category_map = {
@@ -88,14 +77,14 @@ class PrisjaktSpider(scrapy.Spider):
         "grafikkort": "Graphics Cards",
     }
 
-    def parse(self, response):
-        if "category" in response.meta:
-            category = response.meta["category"]
-        else:
-            raw_category = response.url.split("/c/")[-1].split("?")[0]
-            category = self.category_map.get(raw_category, raw_category)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Product links
+    def parse(self, response):
+        raw_category = response.url.split("/c/")[-1].split("?")[0]
+        category = self.category_map.get(raw_category, raw_category)
+
         product_links = response.css('a[href^="/produkt.php?p="]::attr(href)').getall()
         for href in sorted(set(product_links)):
             yield response.follow(
@@ -104,10 +93,7 @@ class PrisjaktSpider(scrapy.Spider):
                 meta={"category": category},
             )
 
-        # Pagination: first try dedicated next-button
         next_page = response.css('a[data-test="PaginationNavigation-next"]::attr(href)').get()
-
-        # Fallback: last pagination link
         if not next_page:
             all_pages = response.css('a[data-test="PaginationLink"]::attr(href)').getall()
             if all_pages:
@@ -115,7 +101,6 @@ class PrisjaktSpider(scrapy.Spider):
                 if candidate and candidate != response.url:
                     next_page = candidate
 
-        # Only follow if it's really different
         if next_page and next_page != response.url:
             yield response.follow(
                 next_page,
@@ -132,19 +117,13 @@ class PrisjaktSpider(scrapy.Spider):
         yield from self._extract_offers_from_jsonld(response, product_id, title, category)
         yield from self._extract_offers_from_embedded_json(response, product_id, title, category)
 
-    # ===== Offer extractors =====
+    # ===== extractors =====
     def _extract_offers_from_html(self, response, product_id, title, category):
-        offer_nodes = response.css(
-            '[class*="Offer"], [class*="offer"], [class*="store"], [class*="Dealer"], '
-            '[data-test*="Offer"], [data-test*="offer"], [data-test*="StoreRow"], [data-test*="Row"]'
-        )
+        offer_nodes = response.css('[class*="Offer"], [data-test*="Offer"], [data-test*="StoreRow"]')
         for row in offer_nodes:
             store = row.css('[data-test*="Store"]::text, a[title]::attr(title), img[alt]::attr(alt), a::text').getall()
             store = norm_ws(" ".join(store)) if store else None
-            price_txt = row.css(
-                '[data-test*="Price"]::text, [class*="Price"]::text, [class*="price"]::text, '
-                '.price::text, .Price::text'
-            ).getall()
+            price_txt = row.css('[data-test*="Price"]::text, [class*="Price"]::text').getall()
             price_txt = norm_ws(" ".join(price_txt)) if price_txt else None
 
             if not store and not price_txt:
@@ -152,6 +131,7 @@ class PrisjaktSpider(scrapy.Spider):
 
             value, curr, raw = parse_price(price_txt or "")
             yield {
+                "timestamp": self.timestamp,
                 "category": category,
                 "product_id": product_id,
                 "product_title": title,
@@ -166,21 +146,11 @@ class PrisjaktSpider(scrapy.Spider):
     def _extract_offers_from_jsonld(self, response, product_id, title, category):
         scripts = response.xpath('//script[@type="application/ld+json"]/text()').getall()
         for s in scripts:
-            s = s.strip()
-            if not s:
-                continue
             try:
-                data = json.loads(s)
+                data = json.loads(s.strip())
                 yield from self._yield_offers_from_ld_obj(data, response, product_id, title, category)
-                continue
             except Exception:
-                pass
-            for chunk in re.findall(r"\{.*?\}", s, flags=re.DOTALL):
-                try:
-                    data = json.loads(chunk)
-                    yield from self._yield_offers_from_ld_obj(data, response, product_id, title, category)
-                except Exception:
-                    continue
+                continue
 
     def _yield_offers_from_ld_obj(self, data, response, product_id, title, category):
         if isinstance(data, list):
@@ -190,80 +160,53 @@ class PrisjaktSpider(scrapy.Spider):
         if not isinstance(data, dict):
             return
         if data.get("@type") in ("Product", "AggregateOffer", "Offer") or "offers" in data:
-            offers = data.get("offers")
-            if isinstance(offers, dict) and offers.get("@type") == "Offer":
+            offers = data.get("offers", [])
+            if isinstance(offers, dict):
                 offers = [offers]
-            if isinstance(offers, list):
+            for off in offers:
+                store = None
+                if isinstance(off.get("seller"), dict):
+                    store = off["seller"].get("name")
+                elif isinstance(off.get("seller"), str):
+                    store = off.get("seller")
+                value, curr, raw = parse_price(str(off.get("price", "")))
+                yield {
+                    "timestamp": self.timestamp,
+                    "category": category,
+                    "product_id": product_id,
+                    "product_title": title,
+                    "product_url": response.url,
+                    "seller_name": norm_ws(store),
+                    "price_value": value,
+                    "price_currency": curr or off.get("priceCurrency"),
+                    "price_raw": raw,
+                    "source": "jsonld",
+                }
+
+    def _extract_offers_from_embedded_json(self, response, product_id, title, category):
+        for s in response.css("script::text").getall():
+            if "offer" not in s.lower() and "price" not in s.lower():
+                continue
+            for m in re.finditer(r"\{.*?\}", s, flags=re.DOTALL):
+                try:
+                    obj = json.loads(m.group(0))
+                except Exception:
+                    continue
+                offers = obj.get("offers", [])
+                if isinstance(offers, dict):
+                    offers = [offers]
                 for off in offers:
-                    store = None
-                    if isinstance(off.get("seller"), dict):
-                        store = off["seller"].get("name")
-                    elif isinstance(off.get("seller"), str):
-                        store = off.get("seller")
-                    value = None
-                    curr = off.get("priceCurrency")
-                    raw = None
-                    price_field = off.get("price")
-                    if isinstance(price_field, (int, float)):
-                        value = float(price_field)
-                    elif isinstance(price_field, str):
-                        value, curr2, raw = parse_price(f"{price_field} {curr or ''}")
-                        if curr is None:
-                            curr = curr2
+                    store = off.get("store") or off.get("seller")
+                    value, curr, raw = parse_price(str(off.get("price", "")))
                     yield {
+                        "timestamp": self.timestamp,
                         "category": category,
                         "product_id": product_id,
                         "product_title": title,
                         "product_url": response.url,
                         "seller_name": norm_ws(store),
                         "price_value": value,
-                        "price_currency": curr,
-                        "price_raw": raw if raw else str(price_field) if price_field else None,
-                        "source": "jsonld",
+                        "price_currency": curr or off.get("priceCurrency"),
+                        "price_raw": raw,
+                        "source": "embedded_json",
                     }
-
-    def _extract_offers_from_embedded_json(self, response, product_id, title, category):
-        for s in response.css("script::text").getall():
-            if "offer" not in s.lower() and "store" not in s.lower() and "price" not in s.lower():
-                continue
-            for m in re.finditer(r"\{.*?\}", s, flags=re.DOTALL):
-                chunk = m.group(0)
-                try:
-                    obj = json.loads(chunk)
-                except Exception:
-                    continue
-                candidates = []
-                if isinstance(obj, dict):
-                    if "offers" in obj and isinstance(obj["offers"], list):
-                        candidates = obj["offers"]
-                    for k, v in obj.items():
-                        if isinstance(v, dict) and "offers" in v and isinstance(v["offers"], list):
-                            candidates = v["offers"]
-                            break
-                for off in candidates:
-                    store = None
-                    if isinstance(off, dict):
-                        store = off.get("store") or off.get("seller") or off.get("merchant")
-                        if isinstance(store, dict):
-                            store = store.get("name") or store.get("displayName")
-                        price_field = off.get("price") or off.get("amount") or off.get("value")
-                        curr = off.get("currency") or off.get("priceCurrency")
-                        value = None
-                        raw = None
-                        if isinstance(price_field, (int, float)):
-                            value = float(price_field)
-                        elif isinstance(price_field, str):
-                            value, curr2, raw = parse_price(f"{price_field} {curr or ''}")
-                            if curr is None:
-                                curr = curr2
-                        yield {
-                            "category": category,
-                            "product_id": product_id,
-                            "product_title": title,
-                            "product_url": response.url,
-                            "seller_name": norm_ws(str(store) if store else None),
-                            "price_value": value,
-                            "price_currency": curr,
-                            "price_raw": raw if raw else str(price_field) if price_field else None,
-                            "source": "embedded_json",
-                        }
