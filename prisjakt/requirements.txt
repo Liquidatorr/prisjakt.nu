@@ -1,0 +1,9 @@
+scrapy==2.13.3
+pandas==2.2.2
+openpyxl==3.1.5
+google-auth>=2.35.0
+google-auth-oauthlib>=1.2.1
+google-api-python-client>=2.151.0
+PySocks>=1.7.1
+scrapy-rotating-proxies>=0.6.2
+requests>=2.32.3
