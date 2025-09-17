@@ -42,7 +42,7 @@ class PrisjaktExportPipeline:
         self.upload_to_google_drive(spider, excel_file)
 
     def upload_to_google_drive(self, spider, file_path):
-        credentials_path = os.path.join(os.path.dirname(__file__), "spiders/credentials.json")
+        credentials_path = "/home/louverius/projects/tokens/credentials.json"
         token_path = f"/home/louverius/projects/tokens/{spider.name}_token.json"
         creds = None
 
